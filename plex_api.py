@@ -238,7 +238,6 @@ ENDPOINTS_TO_PROBE = [
     ("purchasing",      "v1",    "purchase-orders"),
     ("purchasing",      "v1",    "purchase-order-lines"),
     ("mdm",             "v1",    "parts"),
-    ("mdm",             "v1",    "employees"),
     ("production",      "v1/control", "workcenters"),
     ("manufacturing",   "v1",    "operations"),
     ("manufacturing",   "v1",    "routings"),

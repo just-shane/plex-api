@@ -3,7 +3,17 @@
 ## Overview
 Autodesk Fusion 360 exports its tool libraries as structured JSON documents. These files act as a comprehensive database of tools, tool-holders, and their associated cutting data (feeds and speeds) used for CNC machining operations. 
 
-This reference document outlines the schema of the Fusion 360 `.json` export (such as the `BROTHER SPEEDIO ALUMINUM.json` sample) specifically to support the data mapping required for the daily Plex API synchronization.
+This reference document outlines the schema of the Fusion 360 `.json` export (such as the `BROTHER SPEEDIO ALUMINUM.json` sample) specifically to support the data mapping required for the daily Plex API synchronization. 
+
+**Core Principle**: The Fusion 360 tool library files are the absolute **Source of Truth** for what dictates Plex tooling.
+
+## 🏭 Industry Standard Component Hierarchy Flow
+In standard manufacturing resource planning, tooling data is tracked hierarchically. The script will map the Fusion JSON data to accommodate this flow in Plex:
+1. **Purchased Consumables**: The tools themselves (e.g., end mills, drills) are purchased parts tracked via POs.
+2. **Tool Assemblies**: Consumables are placed into tool assemblies (with their appropriate holders).
+3. **Routing / Operations**: Tool Assemblies are mapped to manufacturing operations.
+4. **Jobs**: When an operation is executed on the shop floor, it generates a Job.
+5. **Manufactured Parts**: The end result of the Job, fully tracing the tooling consumable wear/usage straight through to the physical product built.
 
 ---
 
@@ -74,7 +84,8 @@ Holders are primarily defined by their arrays of `"segments"`, detailing the ste
 
 ## 🚀 Sync Implementation Roadmap Alignment
 When developing the Node.js/PowerShell script to execute the daily Plex push:
-1. **Load** the JSON from the network share.
+1. **Load** the JSON from the network share (The Source of Truth).
 2. **Filter** the `data` array for `type != "holder"` (focus on the cutting tools).
-3. **Map** attributes like `product-id` and `vendor` to query the **Plex Master Tooling List**. If it does not exist, trigger a creation API endpoint.
-4. **Map** the `post-process.number` to ensure the **Plex Workcenter Document** matches the physical tool arrangement.
+3. **Extract & Create Consumables**: Map attributes like `product-id` and `vendor` to query the **Plex Master Tooling List** for the purchased part. If it does not exist, trigger a creation API endpoint.
+4. **Create Assemblies**: Programmatically construct the **Tool Assembly** in Plex and link the newly minted consumable tooling part to this assembly.
+5. **Workcenter & Job Linkage**: Map the `post-process.number` to push the setup into the **Plex Workcenter Document**, guaranteeing the tool assembly flows correctly into the Routing, to the Job, and finally to the Manufactured Part.
