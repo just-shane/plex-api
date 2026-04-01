@@ -8,7 +8,7 @@ The overarching goal of this project is to maintain an up-to-date tooling invent
 
 **The 30,000-Foot View & Industry Standard Data Flow:**
 
-1. **Source Data (Source of Truth)**: Autodesk Fusion 360 maintains a tool library stored as `.json` files on a local network share. 
+1. **Source Data (Source of Truth)**: Autodesk Fusion 360 maintains a tool library stored as `.json` files on a local network share.
 2. **Component Hierarchy (Consumables First)**: In standard tooling management, Tool Assemblies are made up of purchased components. The script's initial focus is on the **consumable cutting tools** (e.g., end mills, drills) purchased from suppliers (tracked as purchased parts via POs).
 3. **Plex Linkage & Traceability**: These consumable purchased parts are linked to Tool Assemblies. Tool Assemblies are then linked to specific Routings/Operations. When an operation runs on the shop floor, it generates a Job, which ultimately produces the manufactured Part.
 4. **Scheduled Sync**: A script runs automatically every day at midnight.
