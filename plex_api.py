@@ -7,6 +7,12 @@ Auth:      X-Plex-Connect-Api-Key header (Consumer Key from Developer Portal)
 Rate:      200 calls/minute
 """
 
+# bootstrap MUST be imported before anything reads PLEX_API_KEY/SECRET from
+# os.environ — it injects values from .env.local (if present) so the dev
+# loop doesn't require setting env vars in every shell. Real shell env
+# always wins via setdefault semantics.
+import bootstrap  # noqa: F401
+
 import requests
 import json
 import csv
@@ -15,13 +21,42 @@ import os
 from datetime import datetime
 
 # ─────────────────────────────────────────────
-# CONFIGURATION — fill these in
+# CONFIGURATION
 # ─────────────────────────────────────────────
-API_KEY     = "k3SmLW3y3mhqJiG6osixbYUmiPsHfB51"       # from developers.plex.com → My Apps
-TENANT_ID   = "a6af9c99-bce5-4938-a007-364dc5603d08"                             # leave blank for default tenant (your PCN)
-BASE_URL    = "https://connect.plex.com"
-TEST_URL    = "https://test.connect.plex.com"
-USE_TEST    = False                          # flip to True to hit test environment first
+# All values come from environment variables (loaded via bootstrap.py
+# from .env.local). Credentials are never hardcoded or committed.
+#
+#   PLEX_API_KEY      — Consumer Key from the Plex Developer Portal
+#   PLEX_API_SECRET   — Consumer Secret (currently optional — Plex
+#                       gateway authenticates on key alone)
+#   PLEX_TENANT_ID    — Target tenant UUID. Default is the Grace
+#                       Engineering production tenant. Tenant IDs
+#                       are not secrets, safe to commit as defaults.
+#   PLEX_USE_TEST     — "1" to hit test.connect.plex.com instead of
+#                       connect.plex.com (production). Default is False
+#                       because the current Fusion2Plex app only exists
+#                       in the production environment.
+#
+# History note: an earlier version of this file hardcoded an old
+# Consumer Key and the wrong Grace UUID (a6af9c99-...). Both are dead.
+# The verified-working configuration is what's defaulted below.
+GRACE_TENANT_ID = "58f781ba-1691-4f32-b1db-381cdb21300c"
+
+API_KEY    = os.environ.get("PLEX_API_KEY", "")
+API_SECRET = os.environ.get("PLEX_API_SECRET", "")
+TENANT_ID  = os.environ.get("PLEX_TENANT_ID", GRACE_TENANT_ID)
+
+BASE_URL = "https://connect.plex.com"
+TEST_URL = "https://test.connect.plex.com"
+# PLEX_BASE_URL — explicit override for the Plex base URL (e.g. the local
+# mock at tools/plex_mock/server.py running on localhost:8080). Empty
+# string means "no override"; BASE_URL / TEST_URL selection applies.
+# Used by the write-validation workflow in issue #92 so the sync can
+# dress-rehearse against a fake-Plex without touching connect.plex.com.
+OVERRIDE_URL = os.environ.get("PLEX_BASE_URL", "").strip()
+USE_TEST = os.environ.get("PLEX_USE_TEST", "").strip().lower() in (
+    "1", "true", "yes", "on", "enabled",
+)
 
 OUTPUT_DIR   = "C:/projects/plex-api/outputs"
 TOOL_LIB_DIR = "Z:\\Engineering\\Tooling\\Fusion_Libraries"  # Mapped drive path containing JSON files
@@ -30,13 +65,25 @@ TOOL_LIB_DIR = "Z:\\Engineering\\Tooling\\Fusion_Libraries"  # Mapped drive path
 # BASE CLIENT
 # ─────────────────────────────────────────────
 class PlexClient:
-    def __init__(self, api_key, tenant_id="", use_test=False):
-        self.base = TEST_URL if use_test else BASE_URL
+    def __init__(self, api_key, api_secret="", tenant_id="", use_test=False, base_url=None):
+        # Resolution order:
+        #   1. explicit base_url kwarg (tests, ad-hoc scripts)
+        #   2. PLEX_BASE_URL env var (deployment-time override — the mock)
+        #   3. TEST_URL if use_test else BASE_URL (original behavior)
+        explicit = (base_url or "").strip()
+        if explicit:
+            self.base = explicit
+        elif OVERRIDE_URL:
+            self.base = OVERRIDE_URL
+        else:
+            self.base = TEST_URL if use_test else BASE_URL
         self.headers = {
             "X-Plex-Connect-Api-Key": api_key,
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        if api_secret:
+            self.headers["X-Plex-Connect-Api-Secret"] = api_secret
         if tenant_id:
             self.headers["X-Plex-Connect-Tenant-Id"] = tenant_id
 
@@ -58,20 +105,87 @@ class PlexClient:
             self._window_start = time.time()
 
     def get(self, collection, version, resource, params=None):
-        """GET request with auto-throttling and error handling"""
+        """
+        GET request with auto-throttling.
+
+        Returns the parsed JSON body on success, or None on any failure.
+        Backward-compatible legacy interface — callers that need to know
+        WHY a request failed (auth error vs network error vs 404 vs JSON
+        parse failure) should use ``get_envelope()`` instead.
+        """
+        env = self.get_envelope(collection, version, resource, params)
+        if not env["ok"]:
+            # Preserve the historical "log to stdout" behaviour for the
+            # legacy callers, then collapse to None.
+            print(f"  HTTP Error {env['status']}: {env['url']}")
+            if env["body"] is not None:
+                snippet = str(env["body"])[:300]
+                print(f"  Response: {snippet}")
+            return None
+        return env["body"]
+
+    def get_envelope(self, collection, version, resource, params=None):
+        """
+        GET request returning a structured envelope.
+
+        Unlike ``get()`` (which returns parsed JSON on success and None on
+        any failure), this method returns a dict so callers can distinguish:
+
+          - successful empty / null responses
+          - authentication errors (401, 403)
+          - other HTTP errors (404, 5xx, ...)
+          - network failures (DNS, timeout, connection refused, ...)
+          - JSON parse failures (response was text/html instead of JSON)
+
+        Returns
+        -------
+        dict
+            {
+                "ok":         bool,        # True iff response was 2xx
+                "status":     int,         # HTTP status; 0 if no response
+                "reason":     str,         # HTTP reason phrase or
+                                           # exception class name
+                "body":       Any,         # parsed JSON if possible,
+                                           # else text, else None
+                "elapsed_ms": int,
+                "url":        str,
+                "error":      str | None,  # human-readable error if not ok
+            }
+        """
         self._throttle()
         url = f"{self.base}/{collection}/{version}/{resource}"
+        started = time.perf_counter()
+
         try:
             r = requests.get(url, headers=self.headers, params=params, timeout=30)
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.HTTPError as e:
-            print(f"  HTTP Error {r.status_code}: {url}")
-            print(f"  Response: {r.text[:300]}")
-            return None
-        except Exception as e:
-            print(f"  Error: {e}")
-            return None
+        except requests.exceptions.RequestException as e:
+            return {
+                "ok": False,
+                "status": 0,
+                "reason": e.__class__.__name__,
+                "body": None,
+                "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                "url": url,
+                "error": str(e),
+            }
+
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+        # Try JSON first; fall back to text; fall back to None.
+        try:
+            body = r.json()
+        except ValueError:
+            body = r.text or None
+
+        return {
+            "ok": r.ok,
+            "status": r.status_code,
+            "reason": r.reason or "",
+            "body": body,
+            "elapsed_ms": elapsed_ms,
+            "url": r.url,
+            "error": None if r.ok else f"HTTP {r.status_code} {r.reason}".strip(),
+        }
 
     def get_paginated(self, collection, version, resource, params=None, limit=100):
         """GET all pages of a paginated endpoint"""
@@ -161,7 +275,7 @@ def extract_purchase_orders(client, supplier=None, date_from=None):
     if results:
         out = os.path.join(OUTPUT_DIR, "plex_purchase_orders.csv")
         write_csv(results, out)
-        print(f"  Saved {len(results)} POs → {out}")
+        print(f"  Saved {len(results)} POs -> {out}")
     return results
 
 
@@ -180,7 +294,7 @@ def extract_parts(client, part_type=None):
     if results:
         out = os.path.join(OUTPUT_DIR, "plex_parts.csv")
         write_csv(results, out)
-        print(f"  Saved {len(results)} parts → {out}")
+        print(f"  Saved {len(results)} parts -> {out}")
     return results
 
 
@@ -195,7 +309,7 @@ def extract_workcenters(client):
     if results:
         out = os.path.join(OUTPUT_DIR, "plex_workcenters.csv")
         write_csv(results, out)
-        print(f"  Saved {len(results)} workcenters → {out}")
+        print(f"  Saved {len(results)} workcenters -> {out}")
     return results
 
 
@@ -210,8 +324,79 @@ def extract_operations(client):
     if results:
         out = os.path.join(OUTPUT_DIR, "plex_operations.csv")
         write_csv(results, out)
-        print(f"  Saved {len(results)} operations → {out}")
+        print(f"  Saved {len(results)} operations -> {out}")
     return results
+
+
+# Category strings used by Plex Grace's supply-items records to identify
+# cutting tools and inserts. Verified empirically against the live API
+# on 2026-04-07. There are 1,109 such records on the Grace tenant.
+TOOLING_CATEGORY = "Tools & Inserts"
+
+
+def extract_supply_items(client, category=None):
+    """
+    Pull supply-items from Plex and (by default) filter to cutting tools.
+
+    Issue #2 — read the baseline tooling inventory from Plex.
+
+    Plex Grace stores cutting tools and inserts as ``supply-items`` under
+    ``inventory/v1/inventory-definitions/supply-items``, NOT under
+    ``mdm/v1/parts`` (which is finished products). The schema is
+    identity-only — vendor part number, description, category, group —
+    no geometry. Geometry stays in Fusion as the source of truth.
+
+    Server-side query filters on this endpoint are silently ignored, so
+    we always pull the full set (~614 KB / 2,516 records on Grace) and
+    filter client-side.
+
+    Parameters
+    ----------
+    client : PlexClient
+    category : str | None
+        If provided, keep only records whose ``category`` matches.
+        Defaults to ``"Tools & Inserts"``. Pass ``""`` (empty string)
+        to disable the filter and return everything.
+
+    Returns
+    -------
+    list[dict] | None
+        The matching supply-item records, or None on a network/auth
+        failure. Records are also written to
+        ``outputs/plex_supply_items.csv`` for diff/snapshot use.
+    """
+    if category is None:
+        category = TOOLING_CATEGORY
+
+    print("\nExtracting Supply Items...")
+    raw = client.get("inventory", "v1", "inventory-definitions/supply-items")
+
+    if raw is None:
+        print("  No response — credentials, network, or subscription issue")
+        return None
+
+    # The response shape is a bare list of dicts (verified empirically)
+    if isinstance(raw, dict):
+        records = raw.get("data") or raw.get("items") or raw.get("rows") or []
+    else:
+        records = raw or []
+
+    total = len(records)
+
+    # Client-side filter
+    if category:
+        records = [r for r in records if r.get("category") == category]
+        print(f"  Pulled {total} supply-items, filtered to {len(records)} "
+              f"with category={category!r}")
+    else:
+        print(f"  Pulled {total} supply-items (no filter)")
+
+    if records:
+        out = os.path.join(OUTPUT_DIR, "plex_supply_items.csv")
+        write_csv(records, out)
+        print(f"  Saved {len(records)} supply-items -> {out}")
+
+    return records
 
 
 # ─────────────────────────────────────────────
@@ -271,18 +456,18 @@ def discover_all(client):
             status = r.status_code
             note = ""
             if status == 200:
-                note = "✅ Available"
+                note = "[OK] Available"
             elif status == 401:
-                note = "❌ Auth error"
+                note = "[ERR] Auth error"
             elif status == 403:
-                note = "🔒 Not subscribed"
+                note = "[LOCK] Not subscribed"
             elif status == 404:
-                note = "❓ Not found"
+                note = "[?] Not found"
             else:
-                note = f"⚠️  HTTP {status}"
+                note = f"[!] HTTP {status}"
         except Exception as e:
             status = 0
-            note = f"❌ Exception: {e}"
+            note = f"[ERR] Exception: {e}"
 
         print(f"  {note:25s} {collection}/{version}/{resource}")
         report.append({
@@ -296,7 +481,7 @@ def discover_all(client):
 
     out = os.path.join(OUTPUT_DIR, "plex_api_discovery.csv")
     write_csv(report, out)
-    print(f"\nDiscovery report saved → {out}")
+    print(f"\nDiscovery report saved -> {out}")
     return report
 
 
@@ -335,24 +520,38 @@ def explore_parts(client):
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    print(f"\n  Full response saved → {out}")
+    print(f"\n  Full response saved -> {out}")
 
     return data
 
 
 if __name__ == "__main__":
+    if not API_KEY:
+        raise SystemExit(
+            "Missing PLEX_API_KEY. Set it in the environment or in .env.local."
+        )
+
     client = PlexClient(
         api_key=API_KEY,
+        api_secret=API_SECRET,
         tenant_id=TENANT_ID,
         use_test=USE_TEST,
     )
 
     print(f"Plex API Client — {'TEST' if USE_TEST else 'PRODUCTION'}")
     print(f"Base URL: {client.base}")
-    print(f"Key: {API_KEY[:8]}{'*' * 20}")
+    print(f"Tenant:   {TENANT_ID or '(default)'}")
+    print(f"Key:      {API_KEY[:8]}{'*' * 20}")
+    print(f"Secret:   {'set' if API_SECRET else '(unset — Plex authenticates on key alone)'}")
+
+    if not USE_TEST:
+        print()
+        print("WARNING: Connected to PRODUCTION Plex environment.")
+        print("         Reads are safe. Writes are blocked at the proxy unless")
+        print("         PLEX_ALLOW_WRITES=1 is also set in the environment.")
 
     # ── Focus: Parts endpoint exploration
-    explore_parts(client)
+    # explore_parts(client)  # NOTE: pulls 19 MB unfiltered — leave commented
 
     # ── Other exploration (uncomment as needed)
     # discover_all(client)

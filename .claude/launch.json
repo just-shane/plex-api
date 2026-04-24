@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "plex-api",
+      "runtimeExecutable": "py",
+      "runtimeArgs": ["run_dev.py"],
+      "port": 5000
+    },
+    {
+      "name": "web",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["--prefix", "web", "vite", "web", "--port", "5174"],
+      "port": 5174
+    }
+  ]
+}
